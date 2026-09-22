@@ -1,0 +1,169 @@
+================================================================================
+NSE QUANT PIPELINE - ROADMAP AND STATUS
+Last updated: 2026-09-22
+================================================================================
+
+WHAT "FROZEN" MEANS HERE
+------------------------
+Tested, running on real data, and not to be edited without a reason and a new
+test. It does NOT mean "proven to make money" - nothing in this pipeline has
+been shown to predict anything yet. See OPEN ISSUES and PENDING.
+
+
+================================================================================
+STAGE 1 - CACHE TO PANEL          STATUS: FROZEN (2026-09-22)
+================================================================================
+
+    Kite API
+       |
+    Daily_cache_v27.py        raw OHLCV + exogenous, orphan-bar trim
+       |
+    data_quality.py           4-gate check -> PASS or QUARANTINE
+       |
+    features_daily.py         ~200 indicators, leak gates, PRESERVE_NA
+       |
+    panel_build.py            cross-section, 5 label variants, liquidity floor
+       |
+    panel.parquet             1,954,703 rows | 1519 symbols | 2016-06-06..2026-09-21
+
+ONE COMMAND (scheduled 23:45 IST weekdays)
+    daily_run.bat
+
+  CORRECTION 2026-09-22: the previous version of this line was FALSE.
+  run_daily.py's run_panel() was a stub that printed "not wired up yet" and
+  returned 0, and it imported Daily_cache_v24. The scheduled job had never
+  built a panel; every panel to date was built by hand. features_daily's
+  assert_leak_free() appeared only inside a docstring and had never run.
+  All three are fixed in run_daily.py v2. Verify with a --skip-cache dry run
+  before trusting the schedule again.
+
+MANUAL EQUIVALENT
+    cd /d C:\Users\karanvsi\PyCharmMiscProject\bigmove_deploy
+    call env_daily.bat
+    echo %CACHE_DAILY_ROOT%          <-- MUST print C:\QuantData\cache_daily
+    python run_daily.py --symbols-file watchlist.txt --only-stale
+
+FULL REBUILD (after any label / floor / universe change)
+    python Daily_cache_v27.py --symbols-file watchlist.txt ^
+        --start-date 2015-01-01 --end-date <today> --force
+    python data_quality.py --root %CACHE_DAILY_ROOT%
+    python panel_build.py --root %CACHE_DAILY_ROOT% ^
+        --panel %CACHE_DAILY_ROOT%\panel --full --min-turnover 1e7 --allow-partial
+
+WHAT IS GUARANTEED AT THIS STAGE
+  - No fabricated bars. Missing stays missing; NaN propagates honestly.
+  - Orphan bars trimmed (Kite reuses tickers after delisting).
+  - Labels joined on timestamp, never on positional index.
+  - Label columns cannot enter X - use panel_feature_columns().
+  - The last 5 sessions are UNKNOWN, not negative.
+  - Liquidity floor is point-in-time: a name enters and leaves as its
+    turnover changes. Not hindsight.
+  - Build signature covers universe + floor + labels + cross-sectional set.
+    Changing any of them FORCES a full rebuild rather than silently mixing.
+  - CACHE_DAILY_ROOT unset is now a hard error (v29). There is no default.
+
+FROZEN PARAMETERS - changing any of these invalidates the panel
+    CACHE_HISTORY_ANCHOR = 2015-01-01    NEVER CHANGE (expanding-rank alphas)
+    LABEL_HORIZON        = 5 sessions
+    PRIMARY_VARIANT      = atr1p5_1p0
+    liquidity floor      = 1e7 (Rs 1 crore/day, 60-session median)
+    embargo              = 5 sessions
+
+LABEL VARIANTS IN THE PANEL (all computed, one is primary)
+    5p3          fixed 5% TP / 3% SL
+    3p2          fixed 3% / 2%
+    atr1p5_1p0   1.5 x ATR / 1.0 x ATR   <-- PRIMARY
+    atr2p0_1p0   2.0 / 1.0
+    atr1p0_1p0   1.0 / 1.0
+  Fixed and ATR variants disagree on 11.5% of rows - genuinely different
+  targets. Freeze which one you EVALUATE on before looking at model results.
+
+
+================================================================================
+STAGE 2 - SOUL LAYER              STATUS: BUILT, NOT VALIDATED
+================================================================================
+
+    soul.py              regime + multidimensional personality (shrunk)
+    memory.py            episodic memory, PIT normalisation, declustering
+    soul_features.py     22 model features incl. self-vs-cross disagreement
+
+    python soul.py regimes     --root %CACHE_DAILY_ROOT%
+    python soul.py personality --root %CACHE_DAILY_ROOT% --multi
+    python memory.py build     --root %CACHE_DAILY_ROOT%
+    python soul_features.py build --root %CACHE_DAILY_ROOT% --every 5 --cross-pool 60000
+    python soul_features.py audit --root %CACHE_DAILY_ROOT%
+
+  Every number here is a HISTORICAL CONDITIONAL RATE. Not a prediction, not
+  calibrated confidence. Three distinct quantities, never to be conflated:
+        memory evidence score  !=  model probability  !=  calibrated confidence
+
+KNOWN DEAD COLUMNS (harmless, will be rejected by the audit)
+    soul_cross_n        saturates at top_k, zero variance
+    soul_cross_strength consequently identical to soul_cross_similarity
+
+
+================================================================================
+STAGE 3 - FEATURE AUDIT           STATUS: BUILT, FIRST REAL RUN IN PROGRESS
+================================================================================
+
+    python feature_audit.py run    --root %CACHE_DAILY_ROOT%
+    python feature_audit.py report --root %CACHE_DAILY_ROOT%
+
+  Selection is fold-local: IC, clustering, candidate choice and the
+  permutation null are all computed on each fold's TRAIN window only.
+  The panel-wide IC / cluster files are DESCRIPTIVE and drive nothing.
+
+
+================================================================================
+STAGE 4 - BASE MODEL              STATUS: NOT STARTED   <-- THE BLOCKER
+================================================================================
+
+  Nothing downstream means anything until this exists. The old 0.652 ROC is
+  void - it was measured on dirty data.
+
+  Base AUC on five generic features is ~0.53. That is the number to beat.
+
+
+================================================================================
+STAGE 5 - BASE vs BASE+SOUL       STATUS: NOT STARTED
+STAGE 6 - LEDGER / CALIBRATION    STATUS: ledger.py built, never run
+STAGE 7 - META-MODEL              STATUS: deliberately not built
+================================================================================
+
+
+================================================================================
+OPEN ISSUES (known, accepted, not blocking Stage 1)
+================================================================================
+  1. Sector membership is NOT point-in-time.
+  2. Futures roll history before the first run is unknown (D_roll=NA early).
+  3. USDINR is alone on the CDS calendar -> completeness unverifiable ->
+     quarantined. Needs a second CDS contract to fix.
+  4. Vendor accuracy is only checked when reconcile.py is run (monthly).
+  5. Panel starts 2016-06-06 (312-bar warmup). For 2015 data, set
+     CACHE_HISTORY_ANCHOR=2013-01-01 and rebuild everything.
+  6. 21 duplicate feature columns at |r| >= 0.999 still in features_daily.py.
+     The audit flags them; they have not been deleted at source.
+  7. Same-day TP+SL touches (0.38% of rows) are unknowable from daily bars.
+     Resolved conservatively as SL and flagged.
+
+================================================================================
+PENDING ACTIONS
+================================================================================
+  [ ] Train the base model on the clean panel; record the real OOS AUC
+  [ ] Run feature_audit against C:\QuantData (not the Desktop copy)
+  [ ] Compare BASE vs BASE+SOUL on identical folds and seed
+  [ ] Start the prediction ledger once a model actually emits predictions
+  [ ] Delete the 21 duplicate columns from features_daily.py at source
+  [ ] reconcile.py --sample 100 (vendor cross-check, monthly)
+  [ ] Verify the scheduled task actually runs run_daily.py v2 end to end
+  [ ] 5-fold feature audit: record per-fold dAUC, feature count and the
+      selected set, then check corr(dAUC, time) - three folds cannot
+      distinguish signal decay from regime difficulty
+
+================================================================================
+THE RULE THAT GOVERNS EVERYTHING BELOW STAGE 1
+================================================================================
+  Every additional layer must beat the previous layer OUT OF SAMPLE, on the
+  same folds, with the evaluation target frozen beforehand - or it does not
+  get promoted into the trading system.
+================================================================================
