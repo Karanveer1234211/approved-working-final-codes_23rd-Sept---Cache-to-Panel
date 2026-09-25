@@ -59,6 +59,7 @@ import re
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable, Optional
@@ -87,6 +88,15 @@ except Exception as exc:
 VERSION = "2026-09-25.strict_nested_oos.v4.no_lookahead"
 SEED = 1729
 XGB_N_JOBS = max(1, min(8, (os.cpu_count() or 2) - 1))
+WORKERS = 1
+
+def configure_parallelism(workers: int) -> None:
+    """Configure candidate-level parallelism without CPU oversubscription."""
+    global WORKERS, XGB_N_JOBS
+    WORKERS = max(1, int(workers))
+    cpu = os.cpu_count() or 2
+    XGB_N_JOBS = max(1, min(8, cpu // WORKERS))
+
 
 N_FOLDS = 5
 LABEL_HORIZON = 5
@@ -955,6 +965,34 @@ def final_integrity_gate(
 
 
 
+# ============================================================
+# BASELINE MODEL FEATURES
+# ============================================================
+
+def choose_baseline_features(df: pd.DataFrame, approved: list[str]) -> list[str]:
+    """Return the existing PIT-approved baseline; never invent a new baseline."""
+    approved = [
+        c for c in approved
+        if c in df.columns and is_numeric_candidate(c, df)
+    ]
+    if approved:
+        return approved
+
+    known = [
+        "D_rsi14",
+        "D_atr_pct",
+        "D_ema20_angle_deg",
+        "D_dvol_z20",
+        "D_pos_in_52w_range",
+    ]
+    known = [c for c in known if c in df.columns and is_numeric_candidate(c, df)]
+    if known:
+        return known
+
+    raise RuntimeError(
+        "No existing baseline feature set found. Refusing to invent a baseline."
+    )
+
 
 # ============================================================
 # STRICT NESTED OOS DISCOVERY — NO LOOK-AHEAD
@@ -1112,24 +1150,34 @@ def strict_nested_oos_discovery(
         auc0, ll0 = metric_pair(yte.to_numpy(), p0)
         hit0 = top1_hit_rate(tefit, yte.to_numpy(), p0)
 
-        # Evaluate the train-selected feature candidates independently.
-        for c in selected:
+        # Evaluate train-selected candidates concurrently. Each candidate is
+        # independent, so this does not alter the leakage boundary: every model
+        # still sees only outer-train rows and is evaluated on the untouched
+        # outer-test rows. XGBoost's per-model thread count is reduced by
+        # configure_parallelism() so workers do not grossly oversubscribe CPU.
+        def _eval_candidate(c: str) -> dict:
             try:
                 cols = baseline + [c]
                 p1 = fit_predict(make_baseline_model(), trfit[cols], ytr, tefit[cols])
                 auc1, ll1 = metric_pair(yte.to_numpy(), p1)
                 hit1 = top1_hit_rate(tefit, yte.to_numpy(), p1)
-                rows.append({
+                return {
                     "fold": f.fold, "feature": c,
                     "auc_base": auc0, "auc_plus": auc1, "delta_auc": auc1 - auc0,
                     "logloss_base": ll0, "logloss_plus": ll1, "delta_logloss": ll0 - ll1,
                     "top1_base": hit0, "top1_plus": hit1, "delta_top1": hit1 - hit0,
                     "n_train": len(trfit), "n_test": len(tefit),
                     "selection_was_train_only": True,
-                })
+                }
             except Exception as exc:
-                rows.append({"fold": f.fold, "feature": c, "error": repr(exc),
-                             "selection_was_train_only": True})
+                return {"fold": f.fold, "feature": c, "error": repr(exc),
+                        "selection_was_train_only": True}
+
+        if WORKERS > 1 and len(selected) > 1:
+            with ThreadPoolExecutor(max_workers=min(WORKERS, len(selected))) as pool:
+                rows.extend(pool.map(_eval_candidate, selected))
+        else:
+            rows.extend(_eval_candidate(c) for c in selected)
 
         # Regime selection is ALSO performed before seeing the outer test.
         regime_map = strict_regime_selection_train_only(df, baseline, selected, target, tr_idx)
@@ -1252,8 +1300,7 @@ def parse_args():
     ap.add_argument("--panel", default="panel.parquet")
     ap.add_argument("--out", default="feature_discovery_v3")
     ap.add_argument("--workers", type=int, default=1,
-                    help="Reserved for future parallel stage implementation. "
-                         "Default 1 is deterministic.")
+                    help="Parallel candidate-model workers. Recommended: 2-4 depending on CPU/RAM.")
     ap.add_argument("--force", action="store_true")
     ap.add_argument(
         "--smoke",
@@ -1278,7 +1325,7 @@ def smoke_test(panel_path: Path, out: Path) -> None:
         raise RuntimeError(f"Panel not found: {panel_path}")
 
     log(f"Panel: {panel_path}")
-    log(f"XGBoost version: {xgb.__version__} | n_jobs={XGB_N_JOBS}")
+    log(f"XGBoost version: {xgb.__version__} | workers={WORKERS} | per-model n_jobs={XGB_N_JOBS}")
     log(f"Panel size: {panel_path.stat().st_size / (1024**2):.1f} MB")
 
     df = load_panel(panel_path)
@@ -1407,6 +1454,9 @@ def smoke_test(panel_path: Path, out: Path) -> None:
 
 def main():
     args = parse_args()
+    if args.workers < 1:
+        raise SystemExit("--workers must be >= 1")
+    configure_parallelism(args.workers)
 
     panel_path = Path(args.panel).resolve()
     out = Path(args.out).resolve()
@@ -1426,12 +1476,14 @@ def main():
         "n_folds": N_FOLDS,
         "label_horizon": LABEL_HORIZON,
         "embargo": EMBARGO,
+        "workers": WORKERS,
+        "xgb_n_jobs_per_model": XGB_N_JOBS,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     atomic_write_json(manifest, out / "run_manifest.json")
 
     log(f"VERSION={VERSION}")
-    log(f"XGBoost version={xgb.__version__} | n_jobs={XGB_N_JOBS}")
+    log(f"XGBoost version={xgb.__version__} | workers={WORKERS} | per-model n_jobs={XGB_N_JOBS}")
     log(f"Output={out}")
 
     df = load_panel(panel_path)
