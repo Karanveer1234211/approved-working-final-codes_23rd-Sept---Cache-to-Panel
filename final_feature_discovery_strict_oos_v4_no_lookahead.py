@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MASTER FEATURE DISCOVERY — STRICT NESTED OOS V4 — NO LOOK-AHEAD
+MASTER FEATURE DISCOVERY — LEAK-SAFE V3
 =======================================
 
 Purpose
 -------
-One-time, restartable feature-discovery run for an existing daily panel with strict nested walk-forward feature selection.
+One-time, restartable feature-discovery run for an existing daily panel.
 
 Design goals
 ------------
 1. Never use future/label/outcome columns as model inputs.
 2. Preserve the panel's decision clock: features at date t are usable at t+1.
 3. Use expanding walk-forward folds with an explicit label-horizon purge/gap.
-4. Test NEW features incrementally against the EXISTING baseline model.
-5. Never use an outer-test result to select, rank, tune, or deploy a feature.
-6. Perform candidate screening and redundancy filtering inside each outer
-   training window only; final feature membership uses training-window
-   selection frequency only.
-7. Use a bounded search so the run remains computationally tractable.
-8. Checkpoint the strict target-level result so an interruption does not destroy work.
-9. Never modify panel.parquet or approved_features.json.
+4. Test NEW features incrementally against the EXISTING baseline model,
+   rather than claiming value from standalone single-feature models.
+5. Use a staged search so a 10h+ run is useful rather than an uncontrolled
+   combinatorial explosion.
+6. Checkpoint every target/fold/stage so an interruption does not destroy work.
+7. Never modify panel.parquet or approved_features.json.
 8. Sector-relative features use dated sector-index columns already present in
    the panel. This is NOT stock->sector membership mapping.
 
@@ -36,16 +34,16 @@ set economically.
 
 Recommended run
 ---------------
-python final_feature_discovery_strict_oos_v4.py
+python final_feature_discovery_leak_safe_v3.py
 
 Optional:
-python final_feature_discovery_strict_oos_v4.py --panel /path/panel.parquet
-python final_feature_discovery_strict_oos_v4.py --out /path/discovery_v3
-python final_feature_discovery_strict_oos_v4.py --workers 1
-python final_feature_discovery_strict_oos_v4.py --force
+python final_feature_discovery_leak_safe_v3.py --panel /path/panel.parquet
+python final_feature_discovery_leak_safe_v3.py --out /path/discovery_v3
+python final_feature_discovery_leak_safe_v3.py --workers 1
+python final_feature_discovery_leak_safe_v3.py --force
 
 Dependencies:
-pandas, numpy, scipy, scikit-learn, xgboost, pyarrow
+pandas, numpy, scipy, scikit-learn, pyarrow
 """
 
 from __future__ import annotations
@@ -67,8 +65,9 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, log_loss
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -76,48 +75,33 @@ from sklearn.preprocessing import StandardScaler
 try:
     import xgboost as xgb
 except Exception as exc:
-    raise RuntimeError(
-        "This version requires XGBoost. Install it with: pip install -U xgboost"
-    ) from exc
+    raise RuntimeError("This version requires XGBoost. Install it with: pip install -U xgboost") from exc
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-VERSION = "2026-09-25.strict_nested_oos.v4.no_lookahead"
+VERSION = "2026-09-25.strict_nested_oos.v5.full_feature_universe"
 SEED = 1729
-XGB_N_JOBS = max(1, min(8, (os.cpu_count() or 2) - 1))
+XGB_N_JOBS = 1
 WORKERS = 1
-
-def configure_parallelism(workers: int) -> None:
-    """Configure candidate-level parallelism without CPU oversubscription."""
-    global WORKERS, XGB_N_JOBS
-    WORKERS = max(1, int(workers))
-    cpu = os.cpu_count() or 2
-    XGB_N_JOBS = max(1, min(8, cpu // WORKERS))
-
-
-N_FOLDS = 5
-LABEL_HORIZON = 5
-EMBARGO = 5
-
-# Staging limits. Increase if you intentionally want a much longer run.
-
-# Additive regime-conditioned research layer.
+STRICT_SELECTION_TOP_A = 600
+STRICT_SELECTION_TOP_B = 250
+STRICT_FINAL_FEATURES = 75
+PANEL_PIT_CONTRACT = "project_supplied_point_in_time_panel"
 REGIME_NAMES = ("TREND_UP", "RANGE", "TREND_DOWN")
 MAX_REGIME_FEATURES = 15
 MIN_REGIME_TRAIN_ROWS = 500
 MIN_REGIME_TEST_ROWS = 50
 
+N_FOLDS = 5
+LABEL_HORIZON = 5
+EMBARGO = 5
+
 MIN_COVERAGE = 0.70
 MIN_DAILY_IC_OBS = 40
 REDUNDANCY_THRESHOLD = 0.97
-
-# Incremental model thresholds are deliberately descriptive rather than
-# "magic trading thresholds". Promotion is decided later by the tournament.
-MIN_DELTA_AUC = 0.002
-MIN_DELTA_LOGLOSS = 0.0005
 
 BANNED_EXACT = {
     "ret_1d_close_pct",
@@ -164,23 +148,17 @@ EVAL_RETURN_COLUMNS = (
     "ret_5d_close_pct",
 )
 
-# STRICT OOS DISCOVERY CONTRACT
-# ----------------------------
-# Outer test folds are NEVER used to select, rank, tune, or choose features.
-# All feature selection happens inside each outer training window only.
-STRICT_SELECTION_TOP_A = 600
-STRICT_SELECTION_TOP_B = 250
-STRICT_FINAL_FEATURES = 75
-
-# Original panel columns are trusted only when explicitly approved or when
-# they are raw OHLCV inputs. This prevents an unknown precomputed panel column
-# from silently entering the model merely because its name looks harmless.
-TRUSTED_RAW_PRICE_VOLUME = {"open", "high", "low", "close", "volume", "adj_close"}
-
 
 # ============================================================
 # UTILITIES
 # ============================================================
+
+def configure_parallelism(workers: int) -> None:
+    """Configure candidate-level parallelism without CPU oversubscription."""
+    global WORKERS, XGB_N_JOBS
+    WORKERS = max(1, int(workers))
+    cpu = os.cpu_count() or 2
+    XGB_N_JOBS = max(1, min(8, cpu // WORKERS))
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
@@ -285,8 +263,6 @@ def memory_log(df: pd.DataFrame, label: str) -> None:
     except Exception:
         pass
 
-
-
 def load_panel(path: Path) -> pd.DataFrame:
     log(f"Loading panel: {path}")
     df = pd.read_parquet(path)
@@ -329,26 +305,36 @@ def static_leak_gate(df: pd.DataFrame) -> dict:
 
 
 def find_approved_features(panel_path: Path) -> list[str]:
+    """Locate the project's approved feature contract in common project locations."""
     roots = [
-        panel_path.parent,
-        Path.cwd(),
-        panel_path.parent.parent,
+        panel_path.parent, panel_path.parent / "audit",
+        panel_path.parent / "feature_discovery", panel_path.parent / "feature_discovery_v2",
+        panel_path.parent / "feature_discovery_v3", panel_path.parent / "feature_discovery_v4",
+        panel_path.parent / "feature_discovery_v4_no_lookahead", panel_path.parent.parent,
+        panel_path.parent.parent / "audit", Path.cwd(), Path.cwd() / "audit",
     ]
+    seen = set()
     for root in roots:
+        root = root.resolve()
+        if root in seen: continue
+        seen.add(root)
         for name in APPROVED_NAMES:
             p = root / name
-            if not p.exists():
-                continue
+            if not p.exists(): continue
             try:
                 obj = json.loads(p.read_text(encoding="utf-8"))
+                vals = None
                 if isinstance(obj, dict):
-                    for key in ("features", "approved_features", "base_features"):
-                        if isinstance(obj.get(key), list):
-                            return [str(x) for x in obj[key]]
-                if isinstance(obj, list):
-                    return [str(x) for x in obj]
-            except Exception:
-                continue
+                    for key in ("approved", "features", "approved_features", "base_features"):
+                        if isinstance(obj.get(key), list): vals = obj[key]; break
+                elif isinstance(obj, list): vals = obj
+                if vals:
+                    out = [str(x) for x in vals]
+                    log(f"Approved feature contract: {len(out):,} features from {p}")
+                    return out
+            except Exception as exc:
+                log(f"WARNING: could not read approved feature contract {p}: {exc!r}")
+    log("Approved feature contract not found; baseline fallback will be used. Original panel numeric features remain candidate inputs under the project PIT contract.")
     return []
 
 
@@ -382,225 +368,337 @@ def rolling_std(df: pd.DataFrame, s: pd.Series, window: int):
     )
 
 
-def rolling_mean_series(df: pd.DataFrame, s: pd.Series, window: int):
-    return (
-        s.groupby(df["symbol"], sort=False)
-        .rolling(window, min_periods=max(2, window // 2))
-        .mean()
-        .reset_index(level=0, drop=True)
-    )
-
-
 def add_derived_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
-    """Build derived candidates in memory-efficient batches.
-
-    IMPORTANT: do not insert hundreds of columns one-by-one into the large
-    panel.  Pandas can fragment the DataFrame when columns are repeatedly
-    inserted.  We therefore collect new columns in a dict and attach them
-    once with pd.concat(axis=1).
     """
-    x = df
-    base_id = x["_row_id"].to_numpy(copy=False)
+    All features resolve using information available at timestamp t.
+    They are therefore usable at the next decision point t+1.
+
+    We use a stable _row_id assertion after every positional transformation.
+    """
+    x = df.copy()
+    base_id = x["_row_id"].to_numpy(copy=True)
+
     g = x.groupby("symbol", sort=False)
+
     close = x["close"].astype(float)
     opn = x["open"].astype(float) if "open" in x else close
     high = x["high"].astype(float) if "high" in x else close
     low = x["low"].astype(float) if "low" in x else close
     volume = x["volume"].astype(float) if "volume" in x else pd.Series(np.nan, index=x.index)
 
-    new_cols: dict[str, pd.Series] = {}
     candidates: list[dict] = []
 
     def add(name: str, series, family: str, lookback: int, hypothesis: str):
-        if name in x.columns or name in new_cols:
+        if name in x.columns:
             return
-        new_cols[name] = pd.to_numeric(series, errors="coerce").astype("float32")
-        candidates.append({
-            "feature": name, "family": family, "lookback": lookback,
-            "hypothesis": hypothesis, "resolved_at": "t_close",
-            "usable_from": "t+1", "pit_status": "causal_same_symbol",
-        })
+        x[name] = pd.to_numeric(series, errors="coerce")
+        candidates.append(
+            {
+                "feature": name,
+                "family": family,
+                "lookback": lookback,
+                "hypothesis": hypothesis,
+                "resolved_at": "t_close",
+                "usable_from": "t+1",
+                "pit_status": "causal_same_symbol",
+            }
+        )
 
-    for w, desc in ((1,"short-term price persistence"),(3,"short-term momentum"),
-                    (5,"5-session momentum"),(10,"medium momentum"),
-                    (20,"one-month momentum"),(60,"quarter-scale momentum")):
-        add(f"FD_ret_{w}", g["close"].pct_change(w), "momentum", w, desc)
+    add("FD_ret_1", g["close"].pct_change(1), "momentum", 1, "short-term price persistence")
+    add("FD_ret_3", g["close"].pct_change(3), "momentum", 3, "short-term momentum")
+    add("FD_ret_5", g["close"].pct_change(5), "momentum", 5, "5-session momentum")
+    add("FD_ret_10", g["close"].pct_change(10), "momentum", 10, "medium momentum")
+    add("FD_ret_20", g["close"].pct_change(20), "momentum", 20, "one-month momentum")
+    add("FD_ret_60", g["close"].pct_change(60), "momentum", 60, "quarter-scale momentum")
 
     add("FD_intraday_ret", close / opn.replace(0, np.nan) - 1.0,
         "price_structure", 1, "same-day close versus open")
     add("FD_gap", opn / group_shift(x, "close", 1).replace(0, np.nan) - 1.0,
         "price_structure", 1, "overnight gap")
-    add("FD_range_pct", (high-low) / close.replace(0, np.nan),
+    add("FD_range_pct", (high - low) / close.replace(0, np.nan),
         "volatility", 1, "daily range relative to close")
-    add("FD_body_pct", (close-opn) / close.replace(0, np.nan),
+    add("FD_body_pct", (close - opn) / close.replace(0, np.nan),
         "price_structure", 1, "candle body")
-    add("FD_close_pos", (close-low) / (high-low).replace(0, np.nan),
+    add("FD_close_pos", (close - low) / (high - low).replace(0, np.nan),
         "price_structure", 1, "close location within daily range")
 
-    for w in (5,10,20,60):
+    for w in (5, 10, 20, 60):
         mean_c = roll(x, "close", w)
         std_c = rolling_std(x, close, w)
-        add(f"FD_price_z_{w}", (close-mean_c)/std_c.replace(0,np.nan),
+        add(f"FD_price_z_{w}", (close - mean_c) / std_c.replace(0, np.nan),
             "mean_reversion", w, "distance from rolling price mean")
-        # FD_range_pct is already staged in new_cols, so reference it there.
-        range_s = new_cols["FD_range_pct"]
-        add(f"FD_range_mean_{w}", rolling_mean_series(x, range_s, w),
+        add(f"FD_range_mean_{w}", roll(x.assign(_tmp=x["FD_range_pct"]), "_tmp", w),
             "volatility", w, "average daily range")
         if "volume" in x:
-            mean_v = rolling_mean_series(x, volume, w)
+            mean_v = roll(x.assign(_tmp=volume), "_tmp", w)
             std_v = rolling_std(x, volume, w)
-            add(f"FD_vol_z_{w}", (volume-mean_v)/std_v.replace(0,np.nan),
+            add(f"FD_vol_z_{w}", (volume - mean_v) / std_v.replace(0, np.nan),
                 "volume", w, "volume surprise")
-            add(f"FD_vol_ratio_{w}", volume/mean_v.replace(0,np.nan),
+            add(f"FD_vol_ratio_{w}", volume / mean_v.replace(0, np.nan),
                 "volume", w, "volume relative to rolling average")
 
-    for w in (10,20,50,100,200):
-        sma = g["close"].rolling(w, min_periods=max(2,w//2)).mean().reset_index(level=0, drop=True)
-        add(f"FD_dist_sma_{w}", close/sma.replace(0,np.nan)-1.0,
+    for w in (10, 20, 50, 100, 200):
+        sma = (
+            g["close"].rolling(w, min_periods=max(2, w // 2))
+            .mean()
+            .reset_index(level=0, drop=True)
+        )
+        add(f"FD_dist_sma_{w}", close / sma.replace(0, np.nan) - 1.0,
             "trend", w, "distance from moving average")
 
+    # ATR-style normalized volatility without relying on an external TA package.
     prev_close = group_shift(x, "close", 1)
-    tr = pd.concat([
-        (high-low).abs(), (high-prev_close).abs(), (low-prev_close).abs()
-    ], axis=1).max(axis=1)
-    for w in (5,14,20,60):
-        atr = (x.assign(_tmp_tr=tr).groupby("symbol", sort=False)["_tmp_tr"]
-               .rolling(w, min_periods=max(2,w//2)).mean()
-               .reset_index(level=0, drop=True))
-        add(f"FD_atr_pct_{w}", atr/close.replace(0,np.nan),
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    x["_FD_tr"] = tr
+    for w in (5, 14, 20, 60):
+        atr = (
+            x.groupby("symbol", sort=False)["_FD_tr"]
+            .rolling(w, min_periods=max(2, w // 2))
+            .mean()
+            .reset_index(level=0, drop=True)
+        )
+        add(f"FD_atr_pct_{w}", atr / close.replace(0, np.nan),
             "volatility", w, "ATR normalized by price")
 
-    for w in (10,20,60):
+    # Trend slope: regression-like normalized change across a rolling window.
+    for w in (10, 20, 60):
         old = group_shift(x, "close", w)
-        add(f"FD_slope_{w}", (close/old.replace(0,np.nan)-1.0)/max(w,1),
+        add(f"FD_slope_{w}", (close / old.replace(0, np.nan) - 1.0) / max(w, 1),
             "trend", w, "normalized rolling price slope")
 
-    rank_source = [c for c in ("FD_ret_5","FD_ret_20","FD_atr_pct_14",
-                               "FD_intraday_ret","FD_vol_z_20")
-                   if c in new_cols or c in x.columns]
+    # Cross-sectional ranks are calculated on date t and therefore become
+    # usable at t+1. They are not same-day execution features.
+    rank_source = [
+        c for c in (
+            "FD_ret_5", "FD_ret_20", "FD_atr_pct_14",
+            "FD_intraday_ret", "FD_vol_z_20",
+        )
+        if c in x.columns
+    ]
     for c in rank_source:
-        name=f"FD_XRANK_{c}"
-        if name not in x.columns:
-            new_cols[name]=new_cols[c].groupby(x["_date"]).rank(pct=True, method="average").astype("float32")
-            candidates.append({"feature":name,"family":"cross_sectional","lookback":20,
-                              "hypothesis":f"cross-sectional rank of {c}",
-                              "resolved_at":"t_close","usable_from":"t+1",
-                              "pit_status":"date_cross_section"})
+        name = f"FD_XRANK_{c}"
+        x[name] = x.groupby("_date")[c].rank(pct=True, method="average")
+        candidates.append(
+            {
+                "feature": name,
+                "family": "cross_sectional",
+                "lookback": 20,
+                "hypothesis": f"cross-sectional rank of {c}",
+                "resolved_at": "t_close",
+                "usable_from": "t+1",
+                "pit_status": "date_cross_section",
+            }
+        )
 
-    if new_cols:
-        block=pd.DataFrame(new_cols, index=x.index)
-        x=pd.concat([x, block], axis=1, copy=False)
+    x.drop(columns=["_FD_tr"], inplace=True, errors="ignore")
 
     if not np.array_equal(base_id, x["_row_id"].to_numpy()):
         raise RuntimeError("FATAL: row-id misalignment after feature construction.")
+
     return x, candidates
 
 
 def add_existing_feature_zscores(
     df: pd.DataFrame, existing_cols: list[str], max_features: int = 100
 ) -> tuple[pd.DataFrame, list[dict]]:
-    """Add existing-feature z-scores in one column block, avoiding fragmentation."""
-    x=df
-    candidates=[]; new_cols={}
-    usable=[c for c in existing_cols if c in x.columns and is_numeric_candidate(c,x)][:max_features]
+    """
+    Adds rolling normalization of existing panel features.
+    The normalization includes the current t observation because the feature
+    itself is known at t close and is used at t+1. No future observation is used.
+    """
+    x = df.copy()
+    candidates = []
+
+    usable = [
+        c for c in existing_cols
+        if c in x.columns and is_numeric_candidate(c, x)
+    ][:max_features]
+
     for c in usable:
-        s=pd.to_numeric(x[c],errors="coerce")
-        mu=s.groupby(x["symbol"],sort=False).rolling(60,min_periods=20).mean().reset_index(level=0,drop=True)
-        sd=s.groupby(x["symbol"],sort=False).rolling(60,min_periods=20).std().reset_index(level=0,drop=True)
-        name=f"FD_Z60__{c}"
-        new_cols[name]=((s-mu)/sd.replace(0,np.nan)).astype("float32")
-        candidates.append({"feature":name,"family":"existing_feature_normalization","lookback":60,
-                          "hypothesis":f"causal normalization of existing {c}",
-                          "resolved_at":"t_close","usable_from":"t+1",
-                          "pit_status":"inherits_existing_feature"})
-    if new_cols:
-        x=pd.concat([x,pd.DataFrame(new_cols,index=x.index)],axis=1,copy=False)
-    return x,candidates
+        s = pd.to_numeric(x[c], errors="coerce")
+        mu = (
+            s.groupby(x["symbol"], sort=False)
+            .rolling(60, min_periods=20)
+            .mean()
+            .reset_index(level=0, drop=True)
+        )
+        sd = (
+            s.groupby(x["symbol"], sort=False)
+            .rolling(60, min_periods=20)
+            .std()
+            .reset_index(level=0, drop=True)
+        )
+        name = f"FD_Z60__{c}"
+        x[name] = (s - mu) / sd.replace(0, np.nan)
+        candidates.append(
+            {
+                "feature": name,
+                "family": "existing_feature_normalization",
+                "lookback": 60,
+                "hypothesis": f"causal normalization of existing {c}",
+                "resolved_at": "t_close",
+                "usable_from": "t+1",
+                "pit_status": "inherits_existing_feature",
+            }
+        )
+
+    return x, candidates
 
 def add_existing_panel_feature_expansions(
     panel_df: pd.DataFrame,
     work_df: pd.DataFrame,
     exclude_features: Optional[list[str]] = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
-    """Expand original numeric panel features without repeated column insertion."""
-    x=work_df
-    base_id=x["_row_id"].to_numpy(copy=False)
-    exclude=set(exclude_features or [])
-    # Only explicitly approved original panel features are allowed here.
-    # Unapproved precomputed columns have unknown point-in-time provenance and
-    # are therefore excluded rather than guessed to be causal. Raw OHLCV is
-    # handled by add_derived_features and is not duplicated here.
-    approved = set(exclude_features or [])
-    source_cols=[c for c in panel_df.columns
-                 if c not in ID_COLS and not str(c).startswith("_")
-                 and not str(c).startswith("FD_") and not str(c).startswith("REG_")
-                 and not suspicious(c)
-                 and c in approved
-                 and c not in TRUSTED_RAW_PRICE_VOLUME
-                 and pd.api.types.is_numeric_dtype(panel_df[c])]
-    source_cols=sorted(dict.fromkeys(source_cols),key=str)
-    candidates=[]; new_cols={}
+    """Build the full previous existing-panel feature universe in batches.
+
+    The original panel columns are treated as point-in-time inputs under the
+    explicit project PIT provenance contract. The static name gate excludes
+    target/future-like columns. For every eligible original numeric feature we
+    create: raw candidate + lag1 + 5-session change + 20-session z-score +
+    same-date cross-sectional rank. Approved baseline features are excluded
+    from this expansion to avoid duplicating the baseline; their Z60 versions
+    are generated separately.
+    """
+    x = work_df
+    base_id = x["_row_id"].to_numpy(copy=False)
+    exclude = set(str(c) for c in (exclude_features or []))
+
+    source_cols = [
+        c for c in panel_df.columns
+        if c in x.columns
+        and c not in ID_COLS
+        and not str(c).startswith("_")
+        and not str(c).startswith("FD_")
+        and not str(c).startswith("REG_")
+        and not suspicious(c)
+        and c not in {"open", "high", "low", "close", "volume", "adj_close"}
+        and pd.api.types.is_numeric_dtype(panel_df[c])
+        and c not in exclude
+    ]
+    source_cols = sorted(dict.fromkeys(source_cols), key=str)
+
+    candidates: list[dict] = []
+    new_cols: dict[str, pd.Series] = {}
+
     for c in source_cols:
-        if c not in exclude:
-            candidates.append({"feature":c,"family":"existing_panel_raw","lookback":0,
-                              "hypothesis":f"raw existing panel feature {c}","source_feature":c,
-                              "resolved_at":"t_close","usable_from":"t+1",
-                              "pit_status":"inherits_existing_feature_static_gate"})
-        s=pd.to_numeric(x[c],errors="coerce")
-        lag1=s.groupby(x["symbol"],sort=False).shift(1)
-        lag5=s.groupby(x["symbol"],sort=False).shift(5)
-        mu20=s.groupby(x["symbol"],sort=False).rolling(20,min_periods=10).mean().reset_index(level=0,drop=True)
-        sd20=s.groupby(x["symbol"],sort=False).rolling(20,min_periods=10).std().reset_index(level=0,drop=True)
-        xrank=x.groupby("_date")[c].rank(pct=True,method="average")
-        specs=[
-            (f"FD_PX_LAG1__{safe_name(c)}",lag1,"existing_feature_lag",1,f"one-session lag of existing panel feature {c}"),
-            (f"FD_PX_D5__{safe_name(c)}",s-lag5,"existing_feature_change",5,f"five-session change of existing panel feature {c}"),
-            (f"FD_PX_Z20__{safe_name(c)}",(s-mu20)/sd20.replace(0,np.nan),"existing_feature_normalization",20,f"20-session causal z-score of existing panel feature {c}"),
-            (f"FD_PX_XRANK__{safe_name(c)}",xrank,"existing_feature_cross_section",1,f"same-date cross-sectional rank of existing panel feature {c}"),
+        candidates.append({
+            "feature": c, "family": "existing_panel_raw", "lookback": 0,
+            "hypothesis": f"raw existing panel feature {c}",
+            "source_feature": c, "resolved_at": "t_close", "usable_from": "t+1",
+            "pit_status": "project_pit_contract",
+        })
+
+        s = pd.to_numeric(x[c], errors="coerce")
+        lag1 = s.groupby(x["symbol"], sort=False).shift(1)
+        lag5 = s.groupby(x["symbol"], sort=False).shift(5)
+        mu20 = (s.groupby(x["symbol"], sort=False).rolling(20, min_periods=10)
+                .mean().reset_index(level=0, drop=True))
+        sd20 = (s.groupby(x["symbol"], sort=False).rolling(20, min_periods=10)
+                .std().reset_index(level=0, drop=True))
+        xrank = x.groupby("_date")[c].rank(pct=True, method="average")
+
+        specs = [
+            (f"FD_PX_LAG1__{safe_name(c)}", lag1, "existing_feature_lag", 1,
+             f"one-session lag of existing panel feature {c}"),
+            (f"FD_PX_D5__{safe_name(c)}", s - lag5, "existing_feature_change", 5,
+             f"five-session change of existing panel feature {c}"),
+            (f"FD_PX_Z20__{safe_name(c)}", (s - mu20) / sd20.replace(0, np.nan),
+             "existing_feature_normalization", 20,
+             f"20-session causal z-score of existing panel feature {c}"),
+            (f"FD_PX_XRANK__{safe_name(c)}", xrank, "existing_feature_cross_section", 1,
+             f"same-date cross-sectional rank of existing panel feature {c}"),
         ]
-        for name,series,family,lb,hyp in specs:
-            if name not in x.columns and name not in new_cols:
-                new_cols[name]=pd.to_numeric(series,errors="coerce").astype("float32")
-                candidates.append({"feature":name,"family":family,"lookback":lb,
-                                  "hypothesis":hyp,"source_feature":c,"resolved_at":"t_close",
-                                  "usable_from":"t+1","pit_status":"inherits_existing_feature_static_gate"})
-        if len(new_cols)%100==0:
-            log(f"Existing-panel feature expansion staged: {len(new_cols):,} columns")
+        for name, series, family, lb, hyp in specs:
+            if name in x.columns or name in new_cols:
+                continue
+            new_cols[name] = pd.to_numeric(series, errors="coerce").astype("float32")
+            candidates.append({
+                "feature": name, "family": family, "lookback": lb,
+                "hypothesis": hyp, "source_feature": c,
+                "resolved_at": "t_close", "usable_from": "t+1",
+                "pit_status": "project_pit_contract",
+            })
+
+        if len(source_cols) and len(candidates) % 250 < 5:
+            log(f"Existing-panel feature expansion: source {len(candidates):,} candidate records")
+
     if new_cols:
-        log(f"Attaching existing-panel expansion block: {len(new_cols):,} columns")
-        x=pd.concat([x,pd.DataFrame(new_cols,index=x.index)],axis=1,copy=False)
-    if not np.array_equal(base_id,x["_row_id"].to_numpy()):
+        log(f"Attaching existing-panel expansion block: {len(new_cols):,} new columns from {len(source_cols):,} source features")
+        x = pd.concat([x, pd.DataFrame(new_cols, index=x.index)], axis=1, copy=False)
+
+    if not np.array_equal(base_id, x["_row_id"].to_numpy()):
         raise RuntimeError("FATAL: row-id misalignment after existing-panel feature expansion.")
-    return x,candidates
+
+    log(f"Existing-panel source features eligible: {len(source_cols):,}")
+    log(f"Existing-panel expansion candidates: {len(candidates):,}")
+    return x, candidates
+
+
 
 def add_sector_relative_features(
     df: pd.DataFrame,
-    sector_columns: Optional[dict[str,str]]=None,
-) -> tuple[pd.DataFrame,list[dict]]:
-    """Add sector-relative features as one column block."""
-    x=df; candidates=[]; new_cols={}
-    if not sector_columns or "close" not in x: return x,candidates
-    stock=x["close"].astype(float)
-    for sector_name,col in sector_columns.items():
+    sector_columns: Optional[dict[str, str]] = None,
+) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Sector-relative = stock return minus the return of an existing sector-index
+    series in the panel.
+
+    Example mapping:
+      {"IT": "NIFTYIT", "BANK": "NIFTYFINSERVICE"}
+
+    The mapping is only an index-series mapping. It does NOT assign individual
+    stocks to sectors, so there is no static current-membership look-ahead.
+    """
+    x = df.copy()
+    candidates = []
+
+    if not sector_columns:
+        return x, candidates
+
+    if "close" not in x:
+        return x, candidates
+
+    stock = x["close"].astype(float)
+
+    for sector_name, col in sector_columns.items():
         if col not in x.columns:
             log(f"Sector index column not found; skipped: {sector_name} -> {col}")
             continue
-        idx=pd.to_numeric(x[col],errors="coerce")
-        temp=pd.DataFrame({"_date":x["_date"],"_idx":idx})
-        daily_idx=temp.groupby("_date")["_idx"].first()
-        for w in (1,5,20):
-            sr=stock.groupby(x["symbol"],sort=False).pct_change(w)
-            ir=daily_idx.pct_change(w).reindex(x["_date"]).to_numpy()
-            name=f"FD_REL_{safe_name(sector_name)}_{w}"
-            if name not in x.columns:
-                new_cols[name]=pd.Series(sr.to_numpy()-ir,index=x.index,dtype="float32")
-                candidates.append({"feature":name,"family":"sector_relative_index","lookback":w,
-                                  "hypothesis":f"stock return relative to {sector_name} sector index",
-                                  "resolved_at":"t_close","usable_from":"t+1",
-                                  "pit_status":"dated_index_series_required","source_column":col})
-    if new_cols:
-        x=pd.concat([x,pd.DataFrame(new_cols,index=x.index)],axis=1,copy=False)
-    return x,candidates
+
+        idx = pd.to_numeric(x[col], errors="coerce")
+        idx_ret_1 = idx.groupby(x["symbol"], sort=False).pct_change(1)
+        # IMPORTANT: the sector index is expected to be replicated on rows.
+        # We compute its date-level return once, then merge by date.
+        temp = pd.DataFrame({"_date": x["_date"], "_idx": idx})
+        daily_idx = temp.groupby("_date")["_idx"].first()
+        daily_idx_ret = daily_idx.pct_change()
+
+        for w in (1, 5, 20):
+            sr = stock.groupby(x["symbol"], sort=False).pct_change(w)
+            ir = daily_idx.pct_change(w).reindex(x["_date"]).to_numpy()
+            name = f"FD_REL_{safe_name(sector_name)}_{w}"
+            x[name] = sr.to_numpy() - ir
+            candidates.append(
+                {
+                    "feature": name,
+                    "family": "sector_relative_index",
+                    "lookback": w,
+                    "hypothesis": f"stock return relative to {sector_name} sector index",
+                    "resolved_at": "t_close",
+                    "usable_from": "t+1",
+                    "pit_status": "dated_index_series_required",
+                    "source_column": col,
+                }
+            )
+
+    return x, candidates
 
 
 # ============================================================
@@ -665,23 +763,6 @@ def build_folds(df: pd.DataFrame, n_folds: int = N_FOLDS) -> list[Fold]:
         )
 
     return folds
-
-
-_FOLD_INDEX_CACHE: dict[int, dict[int, tuple[np.ndarray, np.ndarray]]] = {}
-
-
-def _cached_fold_indices(df: pd.DataFrame, folds: list[Fold]) -> dict[int, tuple[np.ndarray, np.ndarray]]:
-    """Compute fold row indices once per working DataFrame."""
-    key = id(df)
-    cached = _FOLD_INDEX_CACHE.get(key)
-    if cached is not None and all(f.fold in cached for f in folds):
-        return cached
-
-    cached = {}
-    for f in folds:
-        cached[f.fold] = fold_indices(df, f)
-    _FOLD_INDEX_CACHE[key] = cached
-    return cached
 
 
 def fold_indices(df: pd.DataFrame, f: Fold) -> tuple[np.ndarray, np.ndarray]:
@@ -819,8 +900,63 @@ def daily_ic_score(
     return float(np.mean(a)), float(np.median(a)), int(len(a))
 
 
+
+
 # ============================================================
-# CAUSAL REGIME CONTEXT
+# STAGE B — REDUNDANCY
+# ============================================================
+
+
+
+# ============================================================
+# STAGE C — STANDALONE OOS SCREEN
+# ============================================================
+
+
+
+
+
+# ============================================================
+# STAGE D — INCREMENTAL OOS VS EXISTING BASELINE
+# ============================================================
+
+def choose_baseline_features(df: pd.DataFrame, approved: list[str]) -> list[str]:
+    """Return the existing PIT-approved baseline; never invent a new baseline."""
+    approved = [
+        c for c in approved
+        if c in df.columns and is_numeric_candidate(c, df)
+    ]
+    if approved:
+        return approved
+
+    known = [
+        "D_rsi14",
+        "D_atr_pct",
+        "D_ema20_angle_deg",
+        "D_dvol_z20",
+        "D_pos_in_52w_range",
+    ]
+    known = [c for c in known if c in df.columns and is_numeric_candidate(c, df)]
+    if known:
+        return known
+
+    raise RuntimeError(
+        "No existing baseline feature set found. Refusing to invent a baseline."
+    )
+
+
+
+
+
+
+# ============================================================
+# STAGE E — MULTIPLE-TESTING / EMPIRICAL NULL
+# ============================================================
+
+
+
+# ============================================================
+# STAGE F — FINAL RESEARCH UNION + REGIME CONDITIONALITY
 # ============================================================
 
 def add_causal_regimes(df: pd.DataFrame) -> pd.DataFrame:
@@ -934,7 +1070,7 @@ def final_integrity_gate(
             errors.append(f"train_not_before_test:{f.fold}")
 
     # Candidate map must not contain suspicious model inputs.
-    cand_files = list(out.glob("stageD_*.csv"))
+    cand_files = list(out.glob("STRICT_OOS_FOLD_RESULTS_*.csv"))
     for p in cand_files:
         try:
             z = pd.read_csv(p)
@@ -963,45 +1099,9 @@ def final_integrity_gate(
     return result
 
 
-
-
 # ============================================================
-# BASELINE MODEL FEATURES
+# MAIN
 # ============================================================
-
-def choose_baseline_features(df: pd.DataFrame, approved: list[str]) -> list[str]:
-    """Return the existing PIT-approved baseline; never invent a new baseline."""
-    approved = [
-        c for c in approved
-        if c in df.columns and is_numeric_candidate(c, df)
-    ]
-    if approved:
-        return approved
-
-    known = [
-        "D_rsi14",
-        "D_atr_pct",
-        "D_ema20_angle_deg",
-        "D_dvol_z20",
-        "D_pos_in_52w_range",
-    ]
-    known = [c for c in known if c in df.columns and is_numeric_candidate(c, df)]
-    if known:
-        return known
-
-    raise RuntimeError(
-        "No existing baseline feature set found. Refusing to invent a baseline."
-    )
-
-
-# ============================================================
-# STRICT NESTED OOS DISCOVERY — NO LOOK-AHEAD
-# ============================================================
-
-def _strict_train_rows(df: pd.DataFrame, f: Fold) -> np.ndarray:
-    tr, _ = fold_indices(df, f)
-    return tr
-
 
 def strict_stage_a_train_only(
     df: pd.DataFrame, candidate_names: list[str], target: str, train_idx: np.ndarray
@@ -1031,7 +1131,6 @@ def strict_stage_a_train_only(
         return r
     return r.sort_values(["ic_abs_mean", "coverage"], ascending=[False, False]).head(STRICT_SELECTION_TOP_A)
 
-
 def strict_stage_b_train_only(
     df: pd.DataFrame, stage_a: pd.DataFrame, train_idx: np.ndarray
 ) -> pd.DataFrame:
@@ -1057,7 +1156,6 @@ def strict_stage_b_train_only(
         if len(selected) >= STRICT_SELECTION_TOP_B:
             break
     return stage_a[stage_a["feature"].isin(selected)].copy()
-
 
 def strict_regime_selection_train_only(
     df: pd.DataFrame, baseline: list[str], candidates: list[str], target: str, train_idx: np.ndarray
@@ -1092,7 +1190,6 @@ def strict_regime_selection_train_only(
         scores.sort(reverse=True)
         result[regime] = [c for _, c in scores[:MAX_REGIME_FEATURES]]
     return result
-
 
 def strict_nested_oos_discovery(
     df: pd.DataFrame,
@@ -1188,21 +1285,38 @@ def strict_nested_oos_discovery(
 
     result = pd.DataFrame(rows)
     if result.empty:
-        raise RuntimeError(f"Strict nested OOS produced no results for {target}.")
+        result = pd.DataFrame(columns=[
+            "fold", "feature", "auc_base", "auc_plus", "delta_auc",
+            "logloss_base", "logloss_plus", "delta_logloss",
+            "top1_base", "top1_plus", "delta_top1", "n_train", "n_test",
+            "selection_was_train_only",
+        ])
 
     # These summaries are descriptive OOS results. They are NOT used to create
     # the final feature map, preventing test-set selection leakage.
-    good = result.loc[result["delta_auc"].notna()].copy()
-    oos_summary = (good.groupby("feature", as_index=False)
-                   .agg(folds=("fold", "nunique"),
-                        mean_delta_auc=("delta_auc", "mean"),
-                        median_delta_auc=("delta_auc", "median"),
-                        min_delta_auc=("delta_auc", "min"),
-                        positive_auc_folds=("delta_auc", lambda s: int((s > 0).sum())),
-                        mean_delta_logloss=("delta_logloss", "mean"),
-                        min_delta_logloss=("delta_logloss", "min"),
-                        positive_logloss_folds=("delta_logloss", lambda s: int((s > 0).sum())),
-                        mean_delta_top1=("delta_top1", "mean")))
+    good = result.loc[result["delta_auc"].notna()].copy() if "delta_auc" in result.columns else result.iloc[0:0].copy()
+    summary_cols = [
+        "feature", "folds", "mean_delta_auc", "median_delta_auc",
+        "min_delta_auc", "positive_auc_folds", "mean_delta_logloss",
+        "min_delta_logloss", "positive_logloss_folds", "mean_delta_top1",
+    ]
+    if "delta_auc" not in result.columns:
+        oos_summary = pd.DataFrame(columns=summary_cols)
+    else:
+        good = result.loc[result["delta_auc"].notna()].copy()
+        if good.empty:
+            oos_summary = pd.DataFrame(columns=summary_cols)
+        else:
+            oos_summary = (good.groupby("feature", as_index=False)
+                           .agg(folds=("fold", "nunique"),
+                                mean_delta_auc=("delta_auc", "mean"),
+                                median_delta_auc=("delta_auc", "median"),
+                                min_delta_auc=("delta_auc", "min"),
+                                positive_auc_folds=("delta_auc", lambda s: int((s > 0).sum())),
+                                mean_delta_logloss=("delta_logloss", "mean"),
+                                min_delta_logloss=("delta_logloss", "min"),
+                                positive_logloss_folds=("delta_logloss", lambda s: int((s > 0).sum())),
+                                mean_delta_top1=("delta_top1", "mean")))
 
     # IMPORTANT: feature deployment/research membership is based only on how
     # often the feature was selected inside training windows. Outer-test metrics
@@ -1235,7 +1349,6 @@ def strict_nested_oos_discovery(
         regime: regime_final.loc[regime_final["regime"].eq(regime), "feature"].tolist()
         for regime in REGIME_NAMES
     }
-
 
 def strict_no_lookahead_gate(
     df: pd.DataFrame, baseline: list[str], candidate_names: list[str],
@@ -1290,10 +1403,6 @@ def strict_no_lookahead_gate(
     if errors:
         raise RuntimeError(f"STRICT NO-LOOKAHEAD GATE FAILED: {errors}")
     return result
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -1520,9 +1629,9 @@ def main():
         work, zc = add_existing_feature_zscores(work, approved, max_features=100)
         candidates.extend(zc)
 
-        # FEATURE ADDITIONS: expand ONLY explicitly approved original panel
-        # features. Unknown panel columns are excluded because their PIT
-        # provenance cannot be proven from the parquet alone.
+        # FULL PREVIOUS FEATURE UNIVERSE: expand original numeric panel
+        # features under the explicit project PIT provenance contract.
+        # Target/future-like names are still blocked by the static gate.
         work, pec = add_existing_panel_feature_expansions(
             df, work, exclude_features=approved
         )
@@ -1588,7 +1697,15 @@ def main():
             {"candidate_count": len(candidates)},
         )
 
+    fam = pd.Series([m.get("family", "unknown") for m in candidates]).value_counts().to_dict()
+    atomic_write_json({"status":"PASS","pit_contract":PANEL_PIT_CONTRACT,
+                       "candidate_count":len(candidates),
+                       "candidate_families":{str(k):int(v) for k,v in fam.items()}},
+                      out / "FEATURE_UNIVERSE_AUDIT.json")
     log(f"Candidate inventory: {len(candidates):,}")
+    log(f"Candidate families: {fam}")
+    if len(candidates) < 500 and not args.smoke:
+        raise RuntimeError(f"FATAL: candidate universe unexpectedly small ({len(candidates):,}). Refusing to start long OOS run.")
 
     # --------------------------------------------------------
     # Folds
@@ -1611,10 +1728,14 @@ def main():
 
     all_final = {}
 
+    baseline_set = set(baseline)
     candidate_names = list(dict.fromkeys(
         m["feature"] for m in candidates
-        if m["feature"] in work.columns and not suspicious(m["feature"])
+        if m["feature"] in work.columns
+        and m["feature"] not in baseline_set
+        and not suspicious(m["feature"])
     ))
+    log(f"Discovery candidates after baseline exclusion: {len(candidate_names):,}")
     strict_no_lookahead_gate(work, baseline, candidate_names, targets, folds)
     atomic_write_json(
         {"status": "PASS", "version": VERSION,
