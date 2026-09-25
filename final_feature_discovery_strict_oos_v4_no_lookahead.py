@@ -597,42 +597,70 @@ def add_existing_panel_feature_expansions(
     work_df: pd.DataFrame,
     exclude_features: Optional[list[str]] = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
-    """Build the full previous existing-panel feature universe in batches.
+    """Build the previous existing-panel feature universe without a giant peak allocation.
 
-    The original panel columns are treated as point-in-time inputs under the
-    explicit project PIT provenance contract. The static name gate excludes
-    target/future-like columns. For every eligible original numeric feature we
-    create: raw candidate + lag1 + 5-session change + 20-session z-score +
-    same-date cross-sectional rank. Approved baseline features are excluded
-    from this expansion to avoid duplicating the baseline; their Z60 versions
-    are generated separately.
+    The prior implementation constructed all transformed columns in one
+    ``pd.DataFrame(new_cols)`` call. With ~260 source features and ~1.95M
+    rows that can request an ~8-9 GiB contiguous NumPy allocation before the
+    existing working panel is accounted for. That is unnecessary.
+
+    This implementation preserves the same candidate families and PIT logic,
+    but attaches transformations in small source batches. Candidate metadata is
+    accumulated independently, while only one bounded batch of new float32
+    columns is resident during each concat.
     """
     x = work_df
     base_id = x["_row_id"].to_numpy(copy=False)
+    candidates: list[dict] = []
     exclude = set(str(c) for c in (exclude_features or []))
 
-    source_cols, source_exclusions = numeric_like_panel_columns(panel_df)
+    source_cols, _ = numeric_like_panel_columns(panel_df)
     source_cols = [c for c in source_cols if c in x.columns and c not in exclude]
     log(f"Original panel numeric-like feature sources: {len(source_cols):,}")
 
-    candidates: list[dict] = []
-    new_cols: dict[str, pd.Series] = {}
-
+    # Raw existing features are already present in x; no extra memory is needed.
     for c in source_cols:
         candidates.append({
-            "feature": c, "family": "existing_panel_raw", "lookback": 0,
+            "feature": c,
+            "family": "existing_panel_raw",
+            "lookback": 0,
             "hypothesis": f"raw existing panel feature {c}",
-            "source_feature": c, "resolved_at": "t_close", "usable_from": "t+1",
+            "source_feature": c,
+            "resolved_at": "t_close",
+            "usable_from": "t+1",
             "pit_status": "project_pit_contract",
         })
 
+    # Keep the peak temporary allocation bounded. 16 sources x 4 float32
+    # transformations is ~64 columns, roughly 0.5 GiB at 1.95M rows.
+    BATCH_SOURCES = 16
+    batch_cols: dict[str, pd.Series] = {}
+
+    def flush_batch() -> None:
+        nonlocal x, batch_cols
+        if not batch_cols:
+            return
+        block = pd.DataFrame(batch_cols, index=x.index)
+        x = pd.concat([x, block], axis=1, copy=False)
+        del block
+        batch_cols = {}
+
+    for i, c in enumerate(source_cols, 1):
         s = pd.to_numeric(x[c], errors="coerce")
-        lag1 = s.groupby(x["symbol"], sort=False).shift(1)
-        lag5 = s.groupby(x["symbol"], sort=False).shift(5)
-        mu20 = (s.groupby(x["symbol"], sort=False).rolling(20, min_periods=10)
-                .mean().reset_index(level=0, drop=True))
-        sd20 = (s.groupby(x["symbol"], sort=False).rolling(20, min_periods=10)
-                .std().reset_index(level=0, drop=True))
+        grouped = s.groupby(x["symbol"], sort=False)
+
+        lag1 = grouped.shift(1)
+        lag5 = grouped.shift(5)
+        mu20 = (
+            grouped.rolling(20, min_periods=10)
+            .mean()
+            .reset_index(level=0, drop=True)
+        )
+        sd20 = (
+            grouped.rolling(20, min_periods=10)
+            .std()
+            .reset_index(level=0, drop=True)
+        )
         xrank = x.groupby("_date")[c].rank(pct=True, method="average")
 
         specs = [
@@ -640,29 +668,35 @@ def add_existing_panel_feature_expansions(
              f"one-session lag of existing panel feature {c}"),
             (f"FD_PX_D5__{safe_name(c)}", s - lag5, "existing_feature_change", 5,
              f"five-session change of existing panel feature {c}"),
-            (f"FD_PX_Z20__{safe_name(c)}", (s - mu20) / sd20.replace(0, np.nan),
+            (f"FD_PX_Z20__{safe_name(c)}",
+             (s - mu20) / sd20.replace(0, np.nan),
              "existing_feature_normalization", 20,
              f"20-session causal z-score of existing panel feature {c}"),
-            (f"FD_PX_XRANK__{safe_name(c)}", xrank, "existing_feature_cross_section", 1,
+            (f"FD_PX_XRANK__{safe_name(c)}", xrank,
+             "existing_feature_cross_section", 1,
              f"same-date cross-sectional rank of existing panel feature {c}"),
         ]
+
         for name, series, family, lb, hyp in specs:
-            if name in x.columns or name in new_cols:
+            if name in x.columns or name in batch_cols:
                 continue
-            new_cols[name] = pd.to_numeric(series, errors="coerce").astype("float32")
+            batch_cols[name] = pd.to_numeric(series, errors="coerce").astype("float32")
             candidates.append({
-                "feature": name, "family": family, "lookback": lb,
-                "hypothesis": hyp, "source_feature": c,
-                "resolved_at": "t_close", "usable_from": "t+1",
+                "feature": name,
+                "family": family,
+                "lookback": lb,
+                "hypothesis": hyp,
+                "source_feature": c,
+                "resolved_at": "t_close",
+                "usable_from": "t+1",
                 "pit_status": "project_pit_contract",
             })
 
-        if len(source_cols) and len(candidates) % 250 < 5:
-            log(f"Existing-panel feature expansion: source {len(candidates):,} candidate records")
+        if i % BATCH_SOURCES == 0:
+            flush_batch()
+            log(f"Existing-panel feature expansion: {i}/{len(source_cols)} sources attached")
 
-    if new_cols:
-        log(f"Attaching existing-panel expansion block: {len(new_cols):,} new columns from {len(source_cols):,} source features")
-        x = pd.concat([x, pd.DataFrame(new_cols, index=x.index)], axis=1, copy=False)
+    flush_batch()
 
     if not np.array_equal(base_id, x["_row_id"].to_numpy()):
         raise RuntimeError("FATAL: row-id misalignment after existing-panel feature expansion.")
@@ -670,7 +704,6 @@ def add_existing_panel_feature_expansions(
     log(f"Existing-panel source features eligible: {len(source_cols):,}")
     log(f"Existing-panel expansion candidates: {len(candidates):,}")
     return x, candidates
-
 
 
 def add_sector_relative_features(
