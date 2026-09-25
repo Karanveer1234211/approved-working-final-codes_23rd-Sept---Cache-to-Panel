@@ -551,6 +551,47 @@ def add_existing_feature_zscores(
 
     return x, candidates
 
+def numeric_like_panel_columns(panel_df: pd.DataFrame) -> tuple[list[str], dict[str, str]]:
+    """Return original panel columns that are safely usable as numeric features.
+
+    Some parquet writers preserve numeric feature columns as object/string dtype.
+    The old expansion code treated those as non-numeric and silently discarded
+    the feature universe. We therefore test numeric-likeness explicitly.
+
+    A column is eligible when >=95% of its non-null values can be parsed as
+    finite numbers. IDs, targets/forward columns, and obvious metadata are
+    still excluded by the existing PIT/name gates.
+    """
+    cols: list[str] = []
+    reasons: dict[str, str] = {}
+    for c in panel_df.columns:
+        if c in ID_COLS or str(c).startswith("_"):
+            continue
+        if str(c).startswith("FD_") or str(c).startswith("REG_"):
+            continue
+        if suspicious(c):
+            reasons[str(c)] = "suspicious_name"
+            continue
+        if c in {"open", "high", "low", "close", "volume", "adj_close"}:
+            continue
+        s = panel_df[c]
+        if pd.api.types.is_numeric_dtype(s):
+            cols.append(c)
+            continue
+        # Handle numeric-looking object/string columns without accepting text.
+        num = pd.to_numeric(s, errors="coerce")
+        nonnull = int(s.notna().sum())
+        if nonnull == 0:
+            reasons[str(c)] = "all_null"
+            continue
+        ratio = float(num.notna().sum()) / nonnull
+        if ratio >= 0.95 and np.isfinite(num.dropna().to_numpy(dtype=float)).all():
+            cols.append(c)
+        else:
+            reasons[str(c)] = f"not_numeric_like:{ratio:.3f}"
+    return sorted(dict.fromkeys(cols), key=str), reasons
+
+
 def add_existing_panel_feature_expansions(
     panel_df: pd.DataFrame,
     work_df: pd.DataFrame,
@@ -570,19 +611,9 @@ def add_existing_panel_feature_expansions(
     base_id = x["_row_id"].to_numpy(copy=False)
     exclude = set(str(c) for c in (exclude_features or []))
 
-    source_cols = [
-        c for c in panel_df.columns
-        if c in x.columns
-        and c not in ID_COLS
-        and not str(c).startswith("_")
-        and not str(c).startswith("FD_")
-        and not str(c).startswith("REG_")
-        and not suspicious(c)
-        and c not in {"open", "high", "low", "close", "volume", "adj_close"}
-        and pd.api.types.is_numeric_dtype(panel_df[c])
-        and c not in exclude
-    ]
-    source_cols = sorted(dict.fromkeys(source_cols), key=str)
+    source_cols, source_exclusions = numeric_like_panel_columns(panel_df)
+    source_cols = [c for c in source_cols if c in x.columns and c not in exclude]
+    log(f"Original panel numeric-like feature sources: {len(source_cols):,}")
 
     candidates: list[dict] = []
     new_cols: dict[str, pd.Series] = {}
@@ -1481,6 +1512,13 @@ def smoke_test(panel_path: Path, out: Path) -> None:
     work, peinv = add_existing_panel_feature_expansions(
         df, work, exclude_features=approved
     )
+    source_cols_smoke, source_exclusions_smoke = numeric_like_panel_columns(df)
+    if len(source_cols_smoke) < 100:
+        raise RuntimeError(
+            "SMOKE FAIL: original panel numeric-like feature universe is only "
+            f"{len(source_cols_smoke):,} columns. Expected the established large feature panel. "
+            "This prevents an incomplete discovery run."
+        )
     if not np.array_equal(df["_row_id"].to_numpy(), work["_row_id"].to_numpy()):
         raise RuntimeError("SMOKE FAIL: row alignment changed after existing-panel feature expansion.")
     log(f"Existing-panel feature expansion candidates: {len(peinv):,}")
@@ -1632,10 +1670,17 @@ def main():
         # FULL PREVIOUS FEATURE UNIVERSE: expand original numeric panel
         # features under the explicit project PIT provenance contract.
         # Target/future-like names are still blocked by the static gate.
+        source_cols_main, source_exclusions_main = numeric_like_panel_columns(df)
+        if len(source_cols_main) < 100:
+            raise RuntimeError(
+                "FATAL: original panel numeric-like feature universe is only "
+                f"{len(source_cols_main):,} columns; refusing to run incomplete discovery."
+            )
         work, pec = add_existing_panel_feature_expansions(
             df, work, exclude_features=approved
         )
         candidates.extend(pec)
+        log(f"Original panel numeric-like feature sources: {len(source_cols_main):,}")
         log(f"Existing-panel feature expansion candidates: {len(pec):,}")
         memory_log(work, "after_panel_expansion")
 
